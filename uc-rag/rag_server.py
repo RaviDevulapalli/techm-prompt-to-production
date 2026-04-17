@@ -153,6 +153,7 @@ def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.4):
     # Select ONLY highest scoring document
     # Prevents mixing HR + IT + Finance
     # ==========================================
+    # CROSS-DOC FIX: enforce single-document selection to prevent blending policies
     top_doc = max(grouped.items(), key=lambda x: max(c["score"] for c in x[1]))
     doc_name, chunks = top_doc
 
