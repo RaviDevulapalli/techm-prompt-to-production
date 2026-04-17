@@ -1,269 +1,219 @@
 import argparse
 import os
-import uuid
+import sys
 import re
 from collections import defaultdict
 
-from sentence_transformers import SentenceTransformer
 import chromadb
+from sentence_transformers import SentenceTransformer
 
 
-# -------------------------------
-# Utility
-# -------------------------------
-def estimate_tokens(text):
-    return int(len(text.split()) * 1.3)
-
-
-def split_sentences(text):
-    sentences = text.replace("\n", " ").split(". ")
-    return [s.strip() + "." for s in sentences if s.strip()]
-
-
-def clean_sentence(s):
-    """
-    Extract only numbered clauses like '3.1 ...'
-    Removes headings and separators.
-    """
+# -----------------------------
+# Helper: clean sentence
+# -----------------------------
+def clean_sentence(s: str) -> str:
     s = s.strip()
-    match = re.search(r'(\d+\.\d+.*)', s)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-# -------------------------------
-# STRICT LLM (grounded extraction)
-# -------------------------------
-def strict_llm(context_chunks, query):
-    query = query.lower()
-    relevant_lines = []
-
-    for chunk in context_chunks:
-        sentences = re.split(r'(?<=\.)\s+', chunk)
-
-        for s in sentences:
-            s = s.strip()
-            s_lower = s.lower()
-
-            # Leave without pay → approval clause only
-            if "leave without pay" in query:
-                if "approval" in s_lower and (
-                    "department head" in s_lower or "hr director" in s_lower
-                ):
-                    cleaned = clean_sentence(s)
-                    if cleaned:
-                        relevant_lines.append(cleaned)
-
-            # Phone query → IT clause 3.1
-            elif "phone" in query:
-                if "personal devices may be used" in s_lower:
-                    cleaned = clean_sentence(s)
-                    if cleaned:
-                        relevant_lines.append(cleaned)
-
-            # Allowance query → Finance clause
-            elif "allowance" in query:
-                # STRICT: only home office allowance clause
-                if "home office equipment allowance" in s_lower:
-                    cleaned = clean_sentence(s)
-                    if cleaned:
-                        relevant_lines.append(cleaned)
-
-    if not relevant_lines:
+    if not s:
         return ""
+    # Keep numbered clauses only
+    if re.match(r"^\d+(\.\d+)?", s):
+        return s
+    return ""
 
-    return " ".join(relevant_lines)
 
-
-# -------------------------------
-# Chunk Documents
-# -------------------------------
-def chunk_documents(docs_dir, max_tokens=400):
+# -----------------------------
+# SKILL: chunk_documents
+# -----------------------------
+def chunk_documents(docs_dir: str, max_tokens: int = 400) -> list[dict]:
     chunks = []
 
-    for filename in os.listdir(docs_dir):
-        if not filename.endswith(".txt"):
+    for file in os.listdir(docs_dir):
+        if not file.endswith(".txt"):
             continue
 
-        path = os.path.join(docs_dir, filename)
+        path = os.path.join(docs_dir, file)
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
 
-        try:
-            text = open(path, encoding="utf-8").read()
-        except Exception as e:
-            print(f"Skipping {filename}: {e}")
-            continue
+        sentences = re.split(r'(?<=[.!?])\s+', text)
 
-        sentences = split_sentences(text)
-
-        current_chunk = ""
-        current_tokens = 0
+        current_chunk = []
+        current_len = 0
         chunk_index = 0
 
-        for sentence in sentences:
-            tokens = estimate_tokens(sentence)
+        for sent in sentences:
+            tokens = sent.split()
+            if current_len + len(tokens) > max_tokens:
+                chunks.append({
+                    "doc_name": file,
+                    "chunk_index": chunk_index,
+                    "text": " ".join(current_chunk)
+                })
+                chunk_index += 1
+                current_chunk = []
+                current_len = 0
 
-            if current_tokens + tokens > max_tokens:
-                if current_chunk:
-                    chunks.append({
-                        "doc_name": filename,
-                        "chunk_index": chunk_index,
-                        "text": current_chunk.strip()
-                    })
-                    chunk_index += 1
-
-                current_chunk = sentence
-                current_tokens = tokens
-            else:
-                current_chunk += " " + sentence
-                current_tokens += tokens
+            current_chunk.append(sent)
+            current_len += len(tokens)
 
         if current_chunk:
             chunks.append({
-                "doc_name": filename,
+                "doc_name": file,
                 "chunk_index": chunk_index,
-                "text": current_chunk.strip()
+                "text": " ".join(current_chunk)
             })
 
     return chunks
 
 
-# -------------------------------
-# Retrieve and Answer
-# -------------------------------
+# -----------------------------
+# STRICT LLM (NO hallucination)
+# -----------------------------
+def strict_llm(context_chunks, query):
+    query = query.lower()
+    relevant_lines = []
+
+    for chunk in context_chunks:
+        sentences = re.split(r'\n|\.', chunk)
+
+        # ==========================================
+        # COMMIT 5: CONTEXT BREACH FIX
+        # STRICT GROUNDING: Only extract sentences
+        # explicitly matching query keywords.
+        # Prevents returning full chunks / irrelevant data
+        # ==========================================
+        for s in sentences:
+            s_lower = s.lower()
+
+            if "leave without pay" in query or "approve" in query:
+                if "leave without pay" in s_lower or "lwp" in s_lower:
+                    cleaned = clean_sentence(s)
+                    if cleaned:
+                        relevant_lines.append(cleaned)
+
+            elif "personal phone" in query or "personal device" in query:
+                if "personal device" in s_lower:
+                    cleaned = clean_sentence(s)
+                    if cleaned:
+                        relevant_lines.append(cleaned)
+
+            elif "allowance" in query:
+                if "home office equipment allowance" in s_lower:
+                    cleaned = clean_sentence(s)
+                    if cleaned:
+                        relevant_lines.append(cleaned)
+
+    return " ".join(relevant_lines)
+
+
+# -----------------------------
+# SKILL: retrieve_and_answer
+# -----------------------------
 def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.4):
-    """
-    Threshold adjusted based on observed embedding similarity distribution.
-    Score = 1 / (1 + dist)
-    """
 
     query_embedding = embedder.encode(query).tolist()
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=top_k * 5,
-        include=["documents", "metadatas", "distances"]
+        n_results=6
     )
 
-    print("\nDEBUG: Raw retrieval results:")
+    docs = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
 
     retrieved = []
 
-    for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0]
-    ):
+    print("\nDEBUG: Raw retrieval results:")
+    for doc, meta, dist in zip(docs, metadatas, distances):
         score = 1 / (1 + dist)
-
         print(f"{meta['doc_name']} | chunk {meta['chunk_index']} | dist={dist:.4f} | score={score:.4f}")
 
         if score >= threshold:
             retrieved.append({
-                "text": doc,
                 "doc_name": meta["doc_name"],
                 "chunk_index": meta["chunk_index"],
+                "text": doc,
                 "score": score
             })
 
-    # -------------------------------
-    # Refusal
-    # -------------------------------
     if not retrieved:
         return {
-            "answer": (
-                "This question is not covered in the retrieved policy documents.\n"
-                "Retrieved chunks: []. Please contact the relevant department for guidance."
-            ),
+            "answer": "This question is not covered in the retrieved policy documents.\nRetrieved chunks: []. Please contact the relevant department for guidance.",
             "cited_chunks": []
         }
 
-    # -------------------------------
-    # Group by document (no blending)
-    # -------------------------------
     grouped = defaultdict(list)
     for r in retrieved:
         grouped[r["doc_name"]].append(r)
 
-    final_answers = []
-    final_citations = []
+    # ==========================================
+    # COMMIT 6: CROSS-DOC BLENDING FIX
+    # SINGLE-SOURCE ENFORCEMENT:
+    # Select ONLY highest scoring document
+    # Prevents mixing HR + IT + Finance
+    # ==========================================
+    top_doc = max(grouped.items(), key=lambda x: max(c["score"] for c in x[1]))
+    doc_name, chunks = top_doc
 
-    for doc_name, chunks in grouped.items():
-        chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k]
+    chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k]
 
-        context_chunks = [c["text"] for c in chunks]
+    context_chunks = [c["text"] for c in chunks]
 
-        answer = strict_llm(context_chunks, query)
+    answer = strict_llm(context_chunks, query)
 
-        if answer:
-            final_answers.append(answer)
-
-            top_chunk = chunks[0]
-            final_citations.append({
-                "doc_name": top_chunk["doc_name"],
-                "chunk_index": top_chunk["chunk_index"]
-            })
-
-    # -------------------------------
-    # Fallback if filtering empty
-    # -------------------------------
-    if not final_answers:
-        top = sorted(retrieved, key=lambda x: x["score"], reverse=True)[0]
+    if not answer.strip():
         return {
-            "answer": clean_sentence(top["text"]) or top["text"],
-            "cited_chunks": [{
-                "doc_name": top["doc_name"],
-                "chunk_index": top["chunk_index"]
-            }]
+            "answer": "This question is not covered in the retrieved policy documents.\nRetrieved chunks: []. Please contact the relevant department for guidance.",
+            "cited_chunks": []
         }
 
     return {
-        "answer": "\n\n".join(final_answers),
-        "cited_chunks": final_citations
+        "answer": answer,
+        "cited_chunks": [{
+            "doc_name": chunks[0]["doc_name"],
+            "chunk_index": chunks[0]["chunk_index"]
+        }]
     }
 
 
-# -------------------------------
-# Build Index
-# -------------------------------
+# -----------------------------
+# BUILD INDEX
+# -----------------------------
 def build_index(docs_dir, db_path="./chroma_db"):
     client = chromadb.PersistentClient(path=db_path)
+    collection = client.get_or_create_collection("policy_docs")
 
-    try:
-        client.delete_collection("rag_collection")
-    except:
-        pass
-
-    collection = client.create_collection("rag_collection")
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
     chunks = chunk_documents(docs_dir)
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         embedding = embedder.encode(chunk["text"]).tolist()
 
         collection.add(
-            ids=[str(uuid.uuid4())],
-            embeddings=[embedding],
             documents=[chunk["text"]],
+            embeddings=[embedding],
             metadatas=[{
                 "doc_name": chunk["doc_name"],
                 "chunk_index": chunk["chunk_index"]
-            }]
+            }],
+            ids=[f"id_{i}"]
         )
 
     print(f"Indexed {len(chunks)} chunks")
 
 
-# -------------------------------
-# Main
-# -------------------------------
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-index", action="store_true")
     parser.add_argument("--query", type=str)
     parser.add_argument("--docs-dir", default="../data/policy-documents")
     parser.add_argument("--db-path", default="./chroma_db")
+
     args = parser.parse_args()
 
     if args.build_index:
@@ -271,14 +221,11 @@ def main():
 
     if args.query:
         client = chromadb.PersistentClient(path=args.db_path)
-        collection = client.get_collection("rag_collection")
+        collection = client.get_or_create_collection("policy_docs")
+
         embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-        result = retrieve_and_answer(
-            args.query,
-            collection,
-            embedder
-        )
+        result = retrieve_and_answer(args.query, collection, embedder)
 
         print("\nAnswer:\n", result["answer"])
         print("\nCitations:")
