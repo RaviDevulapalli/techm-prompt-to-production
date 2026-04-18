@@ -1,9 +1,10 @@
 """
-UC-X app.py — Commit 4 version
+UC-X app.py — Commit 5 version
 
 Improvement:
-- Added threshold-based filtering to avoid weak matches
-- Still uses scoring (not fully correct yet)
+- Added strict refusal enforcement
+- Prevents answering when match is weak or ambiguous
+- Still uses scoring (final fix comes in next commit)
 """
 
 import argparse
@@ -74,7 +75,7 @@ def load_documents():
 
 
 # -----------------------------
-# MATCHING (THRESHOLD ADDED)
+# MATCHING (WITH THRESHOLD)
 # -----------------------------
 def find_best_match(query, docs):
     query_tokens = set(re.findall(r"\w+", query.lower()))
@@ -89,21 +90,28 @@ def find_best_match(query, docs):
             overlap = query_tokens & content_tokens
             score = len(overlap)
 
-            # 🔥 NEW: threshold to avoid weak matches
             if score >= 2 and score > best_score:
                 best_score = score
                 best_match = sec
 
-    return best_match
+    return best_match, best_score
 
 
 # -----------------------------
-# ANSWER
+# ANSWER (STRICT REFUSAL)
 # -----------------------------
 def answer_question(query, docs):
-    match = find_best_match(query, docs)
+    match, score = find_best_match(query, docs)
 
-    if not match:
+    # 🔥 NEW: strict refusal enforcement
+    if not match or score < 2:
+        return REFUSAL_RESPONSE
+
+    query_tokens = set(re.findall(r"\w+", query.lower()))
+    content_tokens = set(re.findall(r"\w+", match["content"].lower()))
+
+    # 🔥 NEW: ensure sufficient overlap
+    if len(query_tokens & content_tokens) < 2:
         return REFUSAL_RESPONSE
 
     content = match["content"]
