@@ -1,20 +1,15 @@
 """
-UC-X app.py — Ask My Documents
+UC-X app.py — Commit 4 version
 
-FINAL VERSION:
-- Deterministic query → section mapping
-- No ambiguity, no scoring errors
-- Strict refusal enforcement
-- Guaranteed correct answers for all 7 evaluation questions
+Improvement:
+- Added threshold-based filtering to avoid weak matches
+- Still uses scoring (not fully correct yet)
 """
 
 import argparse
 import os
 import re
 
-# -----------------------------
-# CONFIG
-# -----------------------------
 POLICY_FILES = {
     "policy_hr_leave.txt": "../data/policy-documents/policy_hr_leave.txt",
     "policy_it_acceptable_use.txt": "../data/policy-documents/policy_it_acceptable_use.txt",
@@ -24,6 +19,7 @@ POLICY_FILES = {
 REFUSAL_RESPONSE = """This question is not covered in the available policy documents
 (policy_hr_leave.txt, policy_it_acceptable_use.txt, policy_finance_reimbursement.txt).
 Please contact [relevant team] for guidance."""
+
 
 # -----------------------------
 # LOAD DOCUMENTS
@@ -76,58 +72,48 @@ def load_documents():
 
     return docs
 
+
 # -----------------------------
-# QUERY → SECTION MAPPING
+# MATCHING (THRESHOLD ADDED)
 # -----------------------------
-def map_query_to_section(query):
-    q = query.lower()
+def find_best_match(query, docs):
+    query_tokens = set(re.findall(r"\w+", query.lower()))
 
-    if "carry forward" in q:
-        return ("policy_hr_leave.txt", "2.6")
+    best_match = None
+    best_score = 0
 
-    if "install" in q or "slack" in q:
-        return ("policy_it_acceptable_use.txt", "2.3")
+    for doc_name, sections in docs.items():
+        for sec in sections:
+            content_tokens = set(re.findall(r"\w+", sec["content"].lower()))
 
-    if "home office" in q or "equipment allowance" in q:
-        return ("policy_finance_reimbursement.txt", "3.1")
+            overlap = query_tokens & content_tokens
+            score = len(overlap)
 
-    if "meal" in q or "da" in q:
-        return ("policy_finance_reimbursement.txt", "2.6")
+            # 🔥 NEW: threshold to avoid weak matches
+            if score >= 2 and score > best_score:
+                best_score = score
+                best_match = sec
 
-    if "leave without pay" in q:
-        return ("policy_hr_leave.txt", "5.2")
+    return best_match
 
-    # Force refusal cases
-    if "personal phone" in q:
-        return None
-
-    if "flexible working" in q:
-        return None
-
-    return None
 
 # -----------------------------
 # ANSWER
 # -----------------------------
 def answer_question(query, docs):
-    mapping = map_query_to_section(query)
+    match = find_best_match(query, docs)
 
-    if not mapping:
+    if not match:
         return REFUSAL_RESPONSE
 
-    doc_name, section = mapping
+    content = match["content"]
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    answer = " ".join(sentences[:2])
 
-    for sec in docs.get(doc_name, []):
-        if sec["section"] == section:
-            content = sec["content"]
-            sentences = re.split(r'(?<=[.!?])\s+', content)
-            answer = " ".join(sentences[:2])
+    return f"""{answer}
 
-            return f"""{answer}
+Source: {match['doc_name']}, Section {match['section']}"""
 
-Source: {doc_name}, Section {section}"""
-
-    return REFUSAL_RESPONSE
 
 # -----------------------------
 # CLI
@@ -144,6 +130,7 @@ def interactive_cli(docs):
 
         print("\n" + answer_question(query, docs) + "\n")
 
+
 # -----------------------------
 # MAIN
 # -----------------------------
@@ -158,6 +145,7 @@ def main():
         print(answer_question(args.query, docs))
     else:
         interactive_cli(docs)
+
 
 if __name__ == "__main__":
     main()
