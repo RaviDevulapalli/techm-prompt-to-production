@@ -1,6 +1,5 @@
 import argparse
 import os
-import sys
 import re
 from collections import defaultdict
 
@@ -9,22 +8,21 @@ from sentence_transformers import SentenceTransformer
 
 
 # -----------------------------
-# Helper: clean sentence
+# Helper
 # -----------------------------
 def clean_sentence(s: str) -> str:
     s = s.strip()
     if not s:
         return ""
-    # Keep numbered clauses only
     if re.match(r"^\d+(\.\d+)?", s):
         return s
     return ""
 
 
 # -----------------------------
-# SKILL: chunk_documents
+# Chunking
 # -----------------------------
-def chunk_documents(docs_dir: str, max_tokens: int = 400) -> list[dict]:
+def chunk_documents(docs_dir: str, max_tokens: int = 400):
     chunks = []
 
     for file in os.listdir(docs_dir):
@@ -37,12 +35,12 @@ def chunk_documents(docs_dir: str, max_tokens: int = 400) -> list[dict]:
 
         sentences = re.split(r'(?<=[.!?])\s+', text)
 
-        current_chunk = []
-        current_len = 0
+        current_chunk, current_len = [], 0
         chunk_index = 0
 
         for sent in sentences:
             tokens = sent.split()
+
             if current_len + len(tokens) > max_tokens:
                 chunks.append({
                     "doc_name": file,
@@ -50,8 +48,7 @@ def chunk_documents(docs_dir: str, max_tokens: int = 400) -> list[dict]:
                     "text": " ".join(current_chunk)
                 })
                 chunk_index += 1
-                current_chunk = []
-                current_len = 0
+                current_chunk, current_len = [], 0
 
             current_chunk.append(sent)
             current_len += len(tokens)
@@ -67,21 +64,15 @@ def chunk_documents(docs_dir: str, max_tokens: int = 400) -> list[dict]:
 
 
 # -----------------------------
-# STRICT LLM (NO hallucination)
+# STRICT EXTRACTION
 # -----------------------------
 def strict_llm(context_chunks, query):
     query = query.lower()
-    relevant_lines = []
+    relevant = []
 
     for chunk in context_chunks:
         sentences = re.split(r'\n|\.', chunk)
 
-        # ==========================================
-        # COMMIT 5: CONTEXT BREACH FIX
-        # STRICT GROUNDING: Only extract sentences
-        # explicitly matching query keywords.
-        # Prevents returning full chunks / irrelevant data
-        # ==========================================
         for s in sentences:
             s_lower = s.lower()
 
@@ -89,27 +80,27 @@ def strict_llm(context_chunks, query):
                 if "leave without pay" in s_lower or "lwp" in s_lower:
                     cleaned = clean_sentence(s)
                     if cleaned:
-                        relevant_lines.append(cleaned)
+                        relevant.append(cleaned)
 
             elif "personal phone" in query or "personal device" in query:
                 if "personal device" in s_lower:
                     cleaned = clean_sentence(s)
                     if cleaned:
-                        relevant_lines.append(cleaned)
+                        relevant.append(cleaned)
 
-            elif "allowance" in query:
-                if "home office equipment allowance" in s_lower:
+            elif "allowance" in query or "reimbursement" in query:
+                if "allowance" in s_lower or "reimbursement" in s_lower:
                     cleaned = clean_sentence(s)
                     if cleaned:
-                        relevant_lines.append(cleaned)
+                        relevant.append(cleaned)
 
-    return " ".join(relevant_lines)
+    return " ".join(relevant)
 
 
 # -----------------------------
-# SKILL: retrieve_and_answer
+# RETRIEVE + ANSWER
 # -----------------------------
-def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.4):
+def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.2):
 
     query_embedding = embedder.encode(query).tolist()
 
@@ -119,15 +110,13 @@ def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.4):
     )
 
     docs = results["documents"][0]
-    metadatas = results["metadatas"][0]
+    metas = results["metadatas"][0]
     distances = results["distances"][0]
 
     retrieved = []
 
-    print("\nDEBUG: Raw retrieval results:")
-    for doc, meta, dist in zip(docs, metadatas, distances):
+    for doc, meta, dist in zip(docs, metas, distances):
         score = 1 / (1 + dist)
-        print(f"{meta['doc_name']} | chunk {meta['chunk_index']} | dist={dist:.4f} | score={score:.4f}")
 
         if score >= threshold:
             retrieved.append({
@@ -137,51 +126,94 @@ def retrieve_and_answer(query, collection, embedder, top_k=3, threshold=0.4):
                 "score": score
             })
 
+    # -----------------------------
+    # TRUE refusal (no retrieval)
+    # -----------------------------
     if not retrieved:
         return {
-            "answer": "This question is not covered in the retrieved policy documents.\nRetrieved chunks: []. Please contact the relevant department for guidance.",
-            "cited_chunks": []
+            "answer": "I can only answer questions about CMC HR, IT, and Finance policies.",
+            "sources": [],
+            "refused": True
         }
 
+    # -----------------------------
+    # RELEVANCE CHECK (CRITICAL FIX)
+    # -----------------------------
+    query_lower = query.lower()
+    keywords = re.findall(r'\b\w+\b', query_lower)
+
+    relevant = False
+    for r in retrieved:
+        text_lower = r["text"].lower()
+        if any(k in text_lower for k in keywords if len(k) > 3):
+            relevant = True
+            break
+
+    if not relevant:
+        return {
+            "answer": "I can only answer questions about CMC HR, IT, and Finance policies.",
+            "sources": [],
+            "refused": True
+        }
+
+    # -----------------------------
+    # Group by document
+    # -----------------------------
     grouped = defaultdict(list)
     for r in retrieved:
         grouped[r["doc_name"]].append(r)
 
-    # ==========================================
-    # COMMIT 6: CROSS-DOC BLENDING FIX
-    # SINGLE-SOURCE ENFORCEMENT:
-    # Select ONLY highest scoring document
-    # Prevents mixing HR + IT + Finance
-    # ==========================================
-    # CROSS-DOC FIX: enforce single-document selection to prevent blending policies
-    top_doc = max(grouped.items(), key=lambda x: max(c["score"] for c in x[1]))
-    doc_name, chunks = top_doc
+    doc_name, chunks = max(
+        grouped.items(),
+        key=lambda x: max(c["score"] for c in x[1])
+    )
 
     chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k]
-
     context_chunks = [c["text"] for c in chunks]
 
+    # -----------------------------
+    # Generate answer
+    # -----------------------------
     answer = strict_llm(context_chunks, query)
 
+    # Fallback if extraction fails
     if not answer.strip():
-        return {
-            "answer": "This question is not covered in the retrieved policy documents.\nRetrieved chunks: []. Please contact the relevant department for guidance.",
-            "cited_chunks": []
-        }
+        fallback = context_chunks[0][:300]
+        answer = f"Based on policy documents: {fallback}"
+
+    sources = [
+        f"{c['doc_name']}::chunk_{c['chunk_index']}"
+        for c in chunks
+    ]
 
     return {
         "answer": answer,
-        "cited_chunks": [{
-            "doc_name": chunks[0]["doc_name"],
-            "chunk_index": chunks[0]["chunk_index"]
-        }]
+        "sources": sources,
+        "refused": False
     }
+
+
+# -----------------------------
+# PUBLIC API
+# -----------------------------
+def query(question: str, llm_call=None):
+    db_path = os.path.join(os.path.dirname(__file__), "stub_chroma_db")
+
+    client = chromadb.PersistentClient(path=db_path)
+    collection = client.get_or_create_collection("policy_docs")
+
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+    return retrieve_and_answer(question, collection, embedder)
 
 
 # -----------------------------
 # BUILD INDEX
 # -----------------------------
-def build_index(docs_dir, db_path="./chroma_db"):
+def build_index(docs_dir, db_path=None):
+    if db_path is None:
+        db_path = os.path.join(os.path.dirname(__file__), "stub_chroma_db")
+
     client = chromadb.PersistentClient(path=db_path)
     collection = client.get_or_create_collection("policy_docs")
 
@@ -202,7 +234,7 @@ def build_index(docs_dir, db_path="./chroma_db"):
             ids=[f"id_{i}"]
         )
 
-    print(f"Indexed {len(chunks)} chunks")
+    print(f"Indexed {len(chunks)} chunks at {db_path}")
 
 
 # -----------------------------
@@ -213,25 +245,19 @@ def main():
     parser.add_argument("--build-index", action="store_true")
     parser.add_argument("--query", type=str)
     parser.add_argument("--docs-dir", default="../data/policy-documents")
-    parser.add_argument("--db-path", default="./chroma_db")
 
     args = parser.parse_args()
 
     if args.build_index:
-        build_index(args.docs_dir, args.db_path)
+        build_index(args.docs_dir)
 
     if args.query:
-        client = chromadb.PersistentClient(path=args.db_path)
-        collection = client.get_or_create_collection("policy_docs")
-
-        embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-        result = retrieve_and_answer(args.query, collection, embedder)
+        result = query(args.query)
 
         print("\nAnswer:\n", result["answer"])
-        print("\nCitations:")
-        for c in result["cited_chunks"]:
-            print(c)
+        print("\nSources:")
+        for s in result["sources"]:
+            print(s)
 
 
 if __name__ == "__main__":
